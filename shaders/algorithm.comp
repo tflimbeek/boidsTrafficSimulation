@@ -1,0 +1,350 @@
+layout(local_size_x = 1) in;
+
+float u(float t){
+    return 1-step(0.0, -t);
+}
+
+void main(){
+    uint i = gl_GlobalInvocationID.x;           // Index of vehicle
+    uint N = gl_NumWorkGroups.x;                // Amount of vehicles
+    uint M = uint(uM);                          // Amount of walls
+    uint P = uint(uP);                          // Amount of road markers
+    uint L = uint(uL);                          // Amount of location markers
+    //float systemDelay = 0.1;                    // Reaction time of the system and its sensors to braking vehicle 
+    bool enableCohesion = true;
+    bool vehicleInCrashDistance = false;
+
+    bool destinationMode;           // Enable if destination buffer has locations in it
+    bool alreadyVisited = false;    
+    bool inFront[cN];           
+
+    // Check if simulation should end
+    if(bSimState[i].steps<bSimState[i].start){
+        return;
+    }
+
+    // vec4 dvel = bMovState[i].dvel;              // Desired velocity of vehicle in world space : OUTPUT
+    vec4 dvel = bMovState[i].vel;              // Desired velocity of vehicle in world space : OUTPUT
+    vec4 vel = bMovState[i].vel;
+    float theta = bPosState[i].rot;
+    
+    // Initialize cohesion, alignment and separation vectors
+    vec4 cohesion = vec4(0.0); 
+    vec4 alignment = vec4(0.0);
+    vec4 seperation = vec4(0.0);
+    
+    uint cn = 0;    // Neighbor counter within sight
+    uint cs = 0;    // Neighbor counter within separation distance
+
+    // Specify field of view (PI_S = shortened version of pi)
+    float FOV = 0.6*PI_S;
+    float speedMultiplier = 1.0;
+    float d_warning = 0;
+    float d_warning_intermediate = 0;
+    float angleTest1 = 0.0;
+
+    float minVehicleDistance = FLT_MAX;
+
+    // Loop over all vehicles 
+    for(int j = 0; j<N; j++){      
+        // Continue if comparison to self would be made or if simulation should still start. 
+        if(i==j || bSimState[j].steps<bSimState[j].start) continue;
+
+        vec2 iPos = vec2(bPosState[i].pos.x, bPosState[i].pos.y);   // Position of vehicle i (the current vehicle)
+        vec2 jPos = vec2(bPosState[j].pos.x, bPosState[j].pos.y);   // Position of vehicle j (the other vehicle)
+
+        // Calculate angle between the vehicles and normalize. The vectors that are used for this calculation are the following:
+        // Vector 1: from centre point vehicle i pointing to centre point vehicle j
+        // Vector 2: unit vector from centre point of vehicle i to direction the vehicle is facing
+        float testAngle = acos(dot(vec2(cos(-bPosState[i].rot+PI_F/2), sin(-bPosState[i].rot+PI_F/2)), jPos-iPos)/length(jPos-iPos));
+        testAngle = mod(testAngle, 2*PI_F);
+
+        // Is vehicle in sight (15m) and within FOV? 
+        if(bDistanceState[i*N+j].dist <= ud_v){
+            
+            // Check if neighboring vehicle has collided. If not, increment neighbor counter
+            if(bSimState[j].collided==0){
+                cn++;
+
+                // Adjust cohesion and alignment
+                if(enableCohesion){
+                    cohesion += bPosState[j].pos - bPosState[i].pos;
+                }
+
+                alignment += (normalize(bMovState[j].vel) + normalize(bMovState[j].dvel))/2;
+            }
+
+            // Check if vehicle is in separation distance?
+            if(bDistanceState[i*N+j].dist <= ud_s){
+                cs++;
+    
+                seperation -= normalize(bPosState[j].pos - bPosState[i].pos) * exp(ud_s - bDistanceState[i*N+j].dist);
+            }
+
+        }
+
+        // Check which vehicles are in front of vehicle i. This is useful for the destination tracking system.
+        if(testAngle < radians(80)){
+            inFront[j] = true;
+            minVehicleDistance = min(minVehicleDistance, bDistanceState[i*N+j].dist);
+            angleTest1 = testAngle;
+        }
+        else{
+            inFront[j] = false;
+        }
+    }
+
+    // Check if the minimum distance to any vehicle falls within the proportional braking distance (dp)
+    // Also check if the angle to that vehicle is within a field of view in which the vehicles are likely to crash
+    // Then perform the corresponding braking action.
+    if((minVehicleDistance <= dp && angleTest1 < radians(45))){ 
+        speedMultiplier = minVehicleDistance/fp;
+        vehicleInCrashDistance = true;
+        if (minVehicleDistance <= de){
+            speedMultiplier = 0.01;
+        }
+    }
+
+    // Divide sums of cohesion and alignment by number of neighbors for an "average"
+    if(cn>0){
+        alignment /= cn;
+        if(enableCohesion == true){
+            cohesion /= cn;
+        }
+    }    
+    
+    // Divide sum of separation by the number of neighbors in the separation distance
+    if(cs>0){
+        seperation /= cs;
+    }
+    
+
+    // Calculate the separation, alignment and cohesion contributions based on their weights for the vehicle-to-vehicle entitiy interactions
+    dvel += uw_ali * alignment;
+    dvel += uw_sep * seperation;
+    if(enableCohesion){
+        dvel += uw_coh*cohesion;
+    }
+
+    // This might be redundant, but the code has not been tested without 
+    bInternalData[i].alignment = alignment;
+    bInternalData[i].seperation = seperation;
+    if(enableCohesion){
+        bInternalData[i].cohesion = cohesion;
+    }
+
+    // Make sure that the desired velocity vector does not exceed a magnitude of the desired speed (2m/s in this case)
+    if(length(dvel)>0){
+        dvel = normalize(dvel) * min(length(dvel), 2.0);
+    }
+
+    // Reset the alignment and separation variables for a new round of calculations
+    alignment = vec4(0.0);
+    seperation = vec4(0.0);
+    cn = 0;
+    cs = 0;
+
+    // Loop over all walls
+    for(int j = 0; j<M; j++){
+        // Gather relevant information in a more compact and clear form
+        float d = bDistanceState[(N+j)*N+i].dist;
+        float alpha = bWallInfo[j].norm;
+
+        // Angle is angle between (up pointing) origin and vehicle (norm in most cases)
+        float a = alpha - theta;
+        a = mod(a+4*PI_S, 2*PI_S);
+
+        // Rotate normal in direction of velocity vehicle
+        float norm_rot = alpha+sign(a-PI_S)*PI_S/2;
+        if(a-PI_S==0){
+            continue;
+        }
+        
+        // Beta agent creation
+        vec4 beta_vel = vec4(cos(PI_S/2-norm_rot), sin(PI_S/2-norm_rot), 0.0, 0.0);   
+        vec4 beta_sep = vec4(cos(PI_S/2-alpha), sin(PI_S/2-alpha), 0.0, 0.0) * d;       // Create seperation vector
+        vec4 beta_pos = bPosState[i].pos + beta_sep;                                    // Calculate position of agent
+
+        if(d<=ud_v){
+            // Apply cohesion to beta-agent
+            cn++;
+
+            // Apply alignment to beta-agent
+            alignment += beta_vel;
+
+            // Apply seperation to beta-agent
+            if(d <= ud_v){
+                cs += 1;
+                seperation += normalize(beta_sep) * exp(ud_s - d);
+            }
+        }     
+    }
+
+    // Calculate average of alignment contributions by the walls
+    if(cn>0){
+        alignment /= cn;
+    }    
+    
+    // Calculate average of separation contributions by the walls
+    if(cs>0){
+        seperation /= cs;
+    }
+    
+    // Calculate contributions to the desired velocity vector by the wall-to-vehicle entitiy interaction stage
+    dvel += uw_ali * alignment;
+    dvel += uw_sep * seperation;
+    
+    // Make sure that the desired velocity vector does not exceed a magnitude of the desired speed (2m/s in this case)
+    if(length(dvel)>0){
+        dvel = normalize(dvel) * min(length(dvel), 2.0);
+    }
+
+    // Reset the alignment and separation variables for a new round of calculations
+    alignment = vec4(0.0);
+    seperation = vec4(0.0);
+    cn = 0;
+    cs = 0;
+
+
+    // Handle road exits
+    for(int j = 0; j<P; j++){
+        float d = bDistanceState[(N+M+j)*N+i].dist;
+        float alpha = bRoadMarkerInfo[j].norm + PI_S;
+
+        // This was used to make vehicles that are supposed to take a road exit ignore the road markers.
+        // Ideally, an automated system should be designed for this but not enough time was available to
+        // implement this in the current iteration of the ismulation environment
+        if(i==0 || i == 2 || i == 5 || i == 7){
+            continue;
+        }
+
+
+        // Angle is angle between (up pointing) origin and vehicle (norm in most cases)           
+        float a = alpha - theta;        // Angle between norm and pointing direction of vehicle
+        a = mod(a+4*PI_S, 2*PI_S);
+
+        // Create a beta-agent
+        // Rotate normal in direction of velocity vehicle
+        float norm_rot = alpha+sign(a-PI_S)*PI_S/2;
+        if(a-PI_S==0){
+            continue;
+        }
+
+        // Caclculate velocity of agent (normalized)
+        vec4 beta_vel = vec4(cos(PI_S/2-norm_rot), sin(PI_S/2-norm_rot), 0.0, 0.0);
+        
+        // Create seperation vector
+        vec4 beta_sep = vec4(cos(PI_S/2-alpha), sin(PI_S/2-alpha), 0.0, 0.0) * d;
+        vec4 beta_pos = bPosState[i].pos + beta_sep;
+
+        if(d<=ud_v){
+            // Apply cohesion to beta-agent
+            cn++;
+
+            // Apply alignment to beta-agent
+            alignment += beta_vel;
+
+            // Apply seperation to beta-agent
+            if(d <= ud_v){
+                cs += 1;
+                seperation += normalize(beta_sep) * exp(ud_s - d);
+            }
+        }     
+    }
+
+    // Handle destinations
+    for(int cnt = 0; cnt < L/2; cnt++){
+        // Check if point has already been visited and take corresponding action
+        alreadyVisited = false;
+        for(int mark = 0; mark < L/2; mark++){
+            if(locationMarkerPos[(L/2)*i+cnt] == bVisitedList[(L/2)*i + mark]){
+                alreadyVisited = true;
+                break;
+            }
+        }
+
+        // If not visited, run calculations for direction to go to
+        if(alreadyVisited == false){
+            vec2 iPos = bPosState[i].pos.xy;                // Position of current vehicle
+            vec2 jPos = locationMarkerPos[(L/2)*i+cnt];     // Position of the desired location marker to go to
+            
+            // Check if the location marker is equal to the "out of bounds" coordinate as defined in the import phase in the python driver code (main.py)
+            // If this is the case, break out of the loop. This value can be set to a different value, but it should be the same as defined here ^
+            if(jPos == vec2(0.0)){
+                break;
+            }
+
+            // Create a vector from the centre point of the vehicle to the direction of the location marker to go to, and calculate that distance
+            vec2 d_direction = jPos-iPos;
+            float currentLength = length(d_direction);
+
+            // Calculate the angle between the centre point of the vehicle and the location marker to go to
+            float testAngle = acos(dot(vec2(cos(-bPosState[i].rot+PI_F/2), sin(-bPosState[i].rot+PI_F/2)), jPos-iPos)/length(jPos-iPos));
+            testAngle = mod(testAngle, 2*PI_F);
+
+            // Make sure the vector in the direction of the location marker has a fixed magnitude to prevent inconsistent acceleration forces
+            if(currentLength > 0.0){
+                d_direction = (d_direction/currentLength)*20;
+            }
+
+            // If the distance to the location marker is smaller than the given value,
+            // the vehicle is deemed close enough to start tracking the next point.
+            if(currentLength < 10.0){
+                for(int test = 0; test < L/2; test++){
+                    if(bVisitedList[(L/2)*i+test] == vec2(0.0, 0.0)){
+                        bVisitedList[(L/2)*i+test] = locationMarkerPos[(L/2)*i+cnt];
+                        break;
+                    }
+                }
+            }
+
+            // Check if any vehicles might be in the way when taking a turn
+            bool vehicleInFront = false;
+            for(int cnt = 0; cnt < N; cnt++){
+                if(inFront[cnt] == true){
+                    vehicleInFront = true;
+                    break;
+                }
+            }
+            
+            // Apply braking if there are vehicles in the way when taking a turn. This function should ideally be automated.
+            // For the current iteration, the y-junction scenario requires a y position > 70 and the road exit scenario a position of at least -10
+            if((minVehicleDistance < 10 && vehicleInFront && bPosState[i].pos.y > 70.0) || (testAngle > radians(35) && bPosState[i].pos.y > 70.0 && vehicleInFront)){
+                speedMultiplier = 0.001;
+                if(minVehicleDistance > 15){
+                    speedMultiplier = 1;
+                }
+            }
+
+            // Apply destination tracking contributions to the desired velocity vector
+            dvel+=uw_coh*vec4((d_direction), 0.0, 0.0);
+            break;
+        }
+    }
+ 
+    // This was accidentally left in, but should not be here. Theoretically it should have no influence in the y-junction road scenario,
+    // but it could have an impact in the road exit scenario. It will be left here in order to let others reproduce the results.
+    if(cn>0){
+        alignment /= cn;
+    }    
+    
+    // This was accidentally left in, but should not be here. Theoretically it should have no influence in the y-junction road scenario,
+    // but it could have an impact in the road exit scenario. It will be left here in order to let others reproduce the results.
+    if(cs>0){
+        seperation /= cs;
+    }
+    
+    // This was accidentally left in, but should not be here. Theoretically it should have no influence in the y-junction road scenario,
+    // but it could have an impact in the road exit scenario. It will be left here in order to let others reproduce the results.
+    dvel += uw_ali * alignment;
+    dvel += uw_sep * seperation;
+
+
+    // Make sure that the desired velocity does not exceed a magnitude of the desired speed (2m/s in this case)
+    if(length(dvel)>0){
+        dvel = normalize(dvel) * min(length(dvel), 2.0);
+    }
+
+    // Apply the velocity scaling factor to the desired velocity vector
+    bMovState[i].dvel = dvel*speedMultiplier;
+}
